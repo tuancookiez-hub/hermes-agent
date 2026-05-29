@@ -2555,6 +2555,21 @@ OPTIONAL_ENV_VARS = {
         "category": "provider",
         "advanced": True,
     },
+    "BYTEPLUS_API_KEY": {
+        "description": "BytePlus Ark Coding Plan API key (Seed, Kimi, GLM, DeepSeek models)",
+        "prompt": "BytePlus API Key",
+        "url": "https://docs.byteplus.com/en/docs/ModelArk/1925114",
+        "password": True,
+        "category": "provider",
+    },
+    "BYTEPLUS_BASE_URL": {
+        "description": "BytePlus base URL override (default: https://ark.ap-southeast.bytepluses.com/api/coding/v3)",
+        "prompt": "BytePlus base URL (leave empty for default)",
+        "url": None,
+        "password": False,
+        "category": "provider",
+        "advanced": True,
+    },
     "AWS_REGION": {
         "description": "AWS region for Bedrock API calls (e.g. us-east-1, eu-central-1)",
         "prompt": "AWS Region",

@@ -415,6 +415,14 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
         api_key_env_vars=("XIAOMI_TOKEN_PLAN_API_KEY",),
         base_url_env_var="XIAOMI_TOKEN_PLAN_BASE_URL",
     ),
+    "modelark-coding-plan": ProviderConfig(
+        id="modelark-coding-plan",
+        name="BytePlus/VolcEngine ModelArk Coding Plan",
+        auth_type="api_key",
+        inference_base_url="https://ark.ap-southeast.bytepluses.com/api/coding/v3",
+        api_key_env_vars=("BYTEPLUS_API_KEY",),
+        base_url_env_var="BYTEPLUS_BASE_URL",
+    ),
     "tencent-tokenhub": ProviderConfig(
         id="tencent-tokenhub",
         name="Tencent TokenHub",
