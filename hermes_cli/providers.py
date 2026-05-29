@@ -185,6 +185,10 @@ HERMES_OVERLAYS: Dict[str, HermesOverlay] = {
         transport="openai_chat",
         base_url_env_var="XIAOMI_TOKEN_PLAN_BASE_URL",
     ),
+    "modelark-coding-plan": HermesOverlay(
+        transport="openai_chat",
+        base_url_env_var="BYTEPLUS_BASE_URL",
+    ),
     "tencent-tokenhub": HermesOverlay(
         transport="openai_chat",
         base_url_env_var="TOKENHUB_BASE_URL",
@@ -334,6 +338,16 @@ ALIASES: Dict[str, str] = {
     "xiaomi-token": "xiaomi-token-plan",
     "mimo-token": "xiaomi-token-plan",
     "token-plan": "xiaomi-token-plan",
+
+    # modelark / byteplus
+    "modelark": "modelark-coding-plan",
+    "byteplus-coding": "modelark-coding-plan",
+    "byteplus_coding": "modelark-coding-plan",
+    "volcengine-coding": "modelark-coding-plan",
+    "bytedance": "modelark-coding-plan",
+    "bytepluses": "modelark-coding-plan",
+    "bytedance-coding": "modelark-coding-plan",
+    "bytedance_coding": "modelark-coding-plan",
 
     # tencent
     "tencent": "tencent-tokenhub",
