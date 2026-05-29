@@ -431,7 +431,14 @@ class _ManagedRotatingFileHandler(RotatingFileHandler):
         return stream
 
     def doRollover(self):
-        super().doRollover()
+        try:
+            super().doRollover()
+        except PermissionError:
+            # Windows: another process/handler has the file open.
+            # Fall back to closing and reopening without rename.
+            if self.stream:
+                self.stream.close()
+            self.stream = self._open()
         self._chmod_if_managed()
         # Our own rollover writes a new baseFilename; refresh the snapshot
         # so the next emit doesn't mistake it for external rotation.
