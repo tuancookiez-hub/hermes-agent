@@ -3,7 +3,9 @@
 import logging
 import os
 import stat
+import sys
 import threading
+import time
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from unittest.mock import patch
@@ -997,3 +999,263 @@ class TestExternalRotationRecovery:
         assert gw_path.exists(), "gateway.log was never recreated"
         assert "AFTER rotation" in gw_path.read_text()
         assert "AFTER rotation" not in rotated.read_text()
+
+
+class TestRolloverWindowsLockRetry:
+    """_ManagedRotatingFileHandler.doRollover survives transient Windows
+    file-lock races (WinError 32 / 5) without dropping the triggering
+    log record.
+
+    Reproduces the bug from production logs where ``os.rename`` in
+    ``RotatingFileHandler.doRollover`` raises ``PermissionError
+    [WinError 32]`` because Defender / a sibling Hermes process /
+    Hindsight briefly holds ``agent.log`` open, and the resulting
+    traceback causes ``logging.Handler.handleError`` to swallow the
+    record that triggered the rollover.
+    """
+
+    def _make_handler(self, log_path: Path) -> hermes_logging._ManagedRotatingFileHandler:
+        # Tiny maxBytes forces rollover on the first emit.
+        handler = hermes_logging._ManagedRotatingFileHandler(
+            str(log_path), maxBytes=1, backupCount=2, encoding="utf-8",
+        )
+        handler.setLevel(logging.INFO)
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        return handler
+
+    def _win32_error(self, winerr: int, msg: str = "file in use") -> PermissionError:
+        """Build a PermissionError that looks like a real WinError 32/5.
+
+        ctypes sets ``winerror`` on OSError/PermissionError on Windows;
+        we set it manually so the helper is cross-platform.
+        """
+        err = PermissionError(msg)
+        err.winerror = winerr  # type: ignore[attr-defined]
+        return err
+
+    def test_retry_succeeds_after_two_transient_lock_failures(self, tmp_path, monkeypatch):
+        """First two rename attempts hit WinError 32; third succeeds.
+
+        This is the actual production pattern: Defender or a sibling
+        process opens the file for ~100ms, our handler retries with
+        backoff, the lock clears, the rename goes through, and the
+        record that triggered the rollover lands in the freshly
+        rotated file.
+        """
+        log_path = tmp_path / "agent.log"
+        handler = self._make_handler(log_path)
+        record = logging.LogRecord(
+            name="test", level=logging.INFO, pathname="", lineno=0,
+            msg="the record that triggered rollover", args=(), exc_info=None,
+        )
+        record.session_tag = ""
+
+        # Patch os.rename so the first two calls fail with WinError 32,
+        # the third call goes through to the real rename.
+        original_rename = os.rename
+        call_count = {"n": 0}
+
+        def flaky_rename(src, dst):
+            call_count["n"] += 1
+            if call_count["n"] <= 2:
+                raise self._win32_error(32, "simulated Defender scan")
+            return original_rename(src, dst)
+
+        # Also patch time.sleep so the test runs in <100ms instead of
+        # ~150ms of real backoff.
+        monkeypatch.setattr("hermes_logging.time.sleep", lambda _s: None)
+        monkeypatch.setattr("os.rename", flaky_rename)
+
+        try:
+            handler.emit(record)
+            handler.flush()
+        finally:
+            handler.close()
+
+        assert call_count["n"] == 3, f"expected 3 rename attempts, got {call_count['n']}"
+        # The record that triggered the rollover MUST have landed in the
+        # live log (not the rotated backup). Before this fix it was lost.
+        assert log_path.exists()
+        assert "triggered rollover" in log_path.read_text()
+
+    def test_give_up_after_max_retries_warns_and_reopens(self, tmp_path, monkeypatch, capfd):
+        """When os.rename keeps failing, doRollover must NOT raise.
+
+        Instead it should:
+          1. Print a single warning line to stderr (not a full traceback).
+          2. Reopen the base file so the next emit has a live fd.
+          3. Swallow the exception — re-raising would lose the record
+             via logging.Handler.handleError.
+        """
+        log_path = tmp_path / "agent.log"
+        handler = self._make_handler(log_path)
+        record = logging.LogRecord(
+            name="test", level=logging.INFO, pathname="", lineno=0,
+            msg="record after stuck rollover", args=(), exc_info=None,
+        )
+        record.session_tag = ""
+
+        def always_fail(src, dst):
+            raise self._win32_error(32, "permanently locked")
+
+        monkeypatch.setattr("hermes_logging.time.sleep", lambda _s: None)
+        monkeypatch.setattr("os.rename", always_fail)
+
+        # Pre-touch the file so _open() after the failed rollover has
+        # a real path to reopen.  (maxBytes=1 forces a rollover on
+        # every emit, so the primer will also exercise the retry path.)
+        handler.emit(logging.LogRecord(
+            name="test", level=logging.INFO, pathname="", lineno=0,
+            msg="primer", args=(), exc_info=None,
+        ))
+
+        # The real emit we care about: must not raise.
+        try:
+            handler.emit(record)
+            handler.flush()
+        finally:
+            handler.close()
+
+        captured = capfd.readouterr()
+        # No traceback in stderr — just warning lines.
+        assert "Traceback" not in captured.err
+        assert "stuck after retries" in captured.err
+        # The base filename appears in at least one warning.
+        assert log_path.name in captured.err
+
+        # The triggering record lands in the file (which _open() recreated).
+        assert log_path.exists()
+        assert "record after stuck rollover" in log_path.read_text()
+
+    def test_non_transient_error_is_reraised(self, tmp_path, monkeypatch):
+        """A real error (WinError 3 path not found) must propagate.
+
+        Only TRANSIENT locks should be swallowed. Real errors stay
+        visible so the operator notices.
+        """
+        log_path = tmp_path / "agent.log"
+        handler = self._make_handler(log_path)
+        record = logging.LogRecord(
+            name="test", level=logging.INFO, pathname="", lineno=0,
+            msg="trigger", args=(), exc_info=None,
+        )
+        record.session_tag = ""
+
+        def real_error(src, dst):
+            err = FileNotFoundError(3, "No such path", src)
+            err.winerror = 3  # type: ignore[attr-defined]
+            raise err
+
+        monkeypatch.setattr("hermes_logging.time.sleep", lambda _s: None)
+        monkeypatch.setattr("os.rename", real_error)
+
+        # logging.Handler.handleError normally swallows exceptions, so
+        # we assert the inner re-raise by calling doRollover directly.
+        try:
+            with pytest.raises(FileNotFoundError) as excinfo:
+                handler.doRollover()
+            assert excinfo.value.winerror == 3
+        finally:
+            handler.close()
+
+    def test_concurrent_rollovers_observe_per_path_lock(self, tmp_path, monkeypatch):
+        """Two threads in the same process running doRollover on the same
+        path don't both reach the parent's ``doRollover`` simultaneously.
+
+        Uses a counter inside a patched parent ``doRollover`` to verify
+        that at no point are two threads inside the critical section
+        concurrently.  This guards against a future regression that
+        accidentally drops the per-path lock.
+        """
+        log_path = tmp_path / "agent.log"
+        handler_a = self._make_handler(log_path)
+        handler_b = self._make_handler(log_path)
+
+        in_section = 0
+        max_concurrent = 0
+        counter_lock = threading.Lock()
+        call_count = 0
+        release = threading.Event()
+
+        def counted_super(self):
+            nonlocal in_section, max_concurrent, call_count
+            with counter_lock:
+                in_section += 1
+                call_count += 1
+                max_concurrent = max(max_concurrent, in_section)
+            # Hold the section open briefly so a second thread would
+            # observe overlap if the lock is broken.  ``release`` is set
+            # by the main thread after a small delay.
+            release.wait(timeout=3)
+            with counter_lock:
+                in_section -= 1
+
+        # Patch the parent class so the lock-protected super().doRollover
+        # call hits our counter.  This must be done on RotatingFileHandler
+        # (the parent) because _ManagedRotatingFileHandler.doRollover
+        # uses super().doRollover() which dispatches via the MRO.
+        monkeypatch.setattr(
+            hermes_logging.RotatingFileHandler, "doRollover", counted_super
+        )
+        monkeypatch.setattr("hermes_logging.time.sleep", lambda _s: None)
+
+        record = logging.LogRecord(
+            name="test", level=logging.INFO, pathname="", lineno=0,
+            msg="x" * 4096, args=(), exc_info=None,
+        )
+        record.session_tag = ""
+
+        def worker(handler):
+            try:
+                handler.emit(record)
+            finally:
+                handler.close()
+
+        ta = threading.Thread(target=worker, args=(handler_a,))
+        tb = threading.Thread(target=worker, args=(handler_b,))
+        ta.start()
+        tb.start()
+
+        # Give the threads a moment to reach super().doRollover.  With
+        # the lock, only one enters; without the lock, both enter and
+        # the counter goes to 2.
+        deadline = time.time() + 2
+        while time.time() < deadline:
+            with counter_lock:
+                if call_count >= 2:
+                    break
+            time.sleep(0.02)
+
+        # Now let them finish.
+        release.set()
+        ta.join(timeout=5)
+        tb.join(timeout=5)
+
+        assert not ta.is_alive()
+        assert not tb.is_alive()
+        assert max_concurrent == 1, (
+            f"per-path lock failed: {max_concurrent} concurrent rollovers observed"
+        )
+
+    def test_is_transient_lock_error_classifier(self):
+        """The helper correctly identifies WinError 32/5 and skips others."""
+        # Windows-style errors that we DO want to retry.
+        assert hermes_logging._is_transient_lock_error(self._win32_error(32)) is True
+        assert hermes_logging._is_transient_lock_error(self._win32_error(5)) is True
+
+        # A real Windows error we do NOT want to retry.
+        err = FileNotFoundError(3, "path not found")
+        err.winerror = 3  # type: ignore[attr-defined]
+        if sys.platform == "win32":
+            assert hermes_logging._is_transient_lock_error(err) is False
+
+        # Plain OSError with no winerror and no errno is not transient.
+        assert hermes_logging._is_transient_lock_error(OSError("weird")) is False
+
+    def test_rollover_lock_is_per_path(self):
+        """Different paths get different locks; same path reuses the lock."""
+        a = hermes_logging._ManagedRotatingFileHandler._get_rollover_lock("/tmp/a.log")
+        b = hermes_logging._ManagedRotatingFileHandler._get_rollover_lock("/tmp/b.log")
+        a2 = hermes_logging._ManagedRotatingFileHandler._get_rollover_lock("/tmp/a.log")
+        assert a is a2, "same path should return the same lock"
+        assert a is not b, "different paths should return different locks"

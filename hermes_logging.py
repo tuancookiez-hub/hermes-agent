@@ -27,9 +27,12 @@ Session context:
     that thread will include ``[session_id]`` for filtering/correlation.
 """
 
+import errno
 import logging
 import os
+import sys
 import threading
+import time
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Optional, Sequence
@@ -319,6 +322,27 @@ def setup_verbose_logging() -> None:
 # Internal helpers
 # ---------------------------------------------------------------------------
 
+def _is_transient_lock_error(e: BaseException) -> bool:
+    """True if ``e`` is a Windows file-in-use / access-denied we should retry.
+
+    On Windows, antivirus, the search indexer, a sibling Hermes process,
+    or the Hindsight embedder can briefly hold the log file open.
+    ``os.rename`` then fails with ``WinError 32`` (sharing violation) or
+    ``WinError 5`` (access denied). These are transient and almost always
+    clear within a few hundred ms.
+
+    ``errno.EBUSY`` / ``EACCES`` cover the POSIX analogues. ``os.rename``
+    on POSIX is atomic and rarely raises either, but including them keeps
+    the retry path symmetric across platforms.
+    """
+    winerr = getattr(e, "winerror", 0) or 0
+    if winerr in (32, 5):
+        return True
+    if sys.platform == "win32":
+        return False
+    return e.errno in (errno.EBUSY, errno.EACCES)
+
+
 class _ManagedRotatingFileHandler(RotatingFileHandler):
     """RotatingFileHandler that ensures group-writable perms in managed mode
     AND survives external rotation.
@@ -353,6 +377,27 @@ class _ManagedRotatingFileHandler(RotatingFileHandler):
         self._stat_dev: Optional[int] = None
         self._stat_ino: Optional[int] = None
         self._record_stream_stat()
+
+    # Per-path rollover locks, shared across instances pointing at the
+    # same resolved file. Different processes can't share a Python lock,
+    # but this serializes within-process contention: two threads hitting
+    # the rotation threshold simultaneously, or the root logger + a child
+    # logger both rotating the same path. The Windows file lock itself
+    # is enforced by the OS; this lock just prevents two threads in the
+    # same process from both paying the cost of a failed rename and
+    # racing on the post-failure reopen.
+    _rollover_locks: "dict[str, threading.Lock]" = {}
+    _rollover_locks_guard = threading.Lock()
+
+    @classmethod
+    def _get_rollover_lock(cls, path: str) -> threading.Lock:
+        key = os.path.normcase(os.path.abspath(path))
+        with cls._rollover_locks_guard:
+            lock = cls._rollover_locks.get(key)
+            if lock is None:
+                lock = threading.Lock()
+                cls._rollover_locks[key] = lock
+            return lock
 
     def _chmod_if_managed(self):
         if self._managed:
@@ -431,7 +476,46 @@ class _ManagedRotatingFileHandler(RotatingFileHandler):
         return stream
 
     def doRollover(self):
-        super().doRollover()
+        """Rotate with retry on transient Windows file-locking races.
+
+        The base class calls ``os.rename``, which fails on Windows when
+        another handle is briefly open on the file (Defender, search
+        indexer, a sibling Hermes process tailing the log, the Hindsight
+        embedder). Without retry, every attempt drops the triggering log
+        record — ``logging.Handler.handleError`` swallows the exception
+        and the record is never written.
+
+        Retries with exponential backoff for ~3 seconds. If still failing,
+        surfaces a single warning line and reopens the base file so the
+        next emit has a live fd. The exception is NOT re-raised when the
+        cause is a transient lock: re-raising would lose the record and
+        print a full traceback, when the handler can self-heal on the
+        next emit. Non-transient errors (real permission / disk issues)
+        are re-raised so they stay visible.
+        """
+        last_err: Optional[BaseException] = None
+        with self._get_rollover_lock(self.baseFilename):
+            for attempt in range(8):
+                try:
+                    super().doRollover()
+                    last_err = None
+                    break
+                except (OSError, PermissionError) as e:
+                    if not _is_transient_lock_error(e):
+                        raise
+                    last_err = e
+                    if attempt < 7:
+                        time.sleep(min(0.05 * (1.5 ** attempt), 0.5))
+            if last_err is not None:
+                sys.stderr.write(
+                    f"[hermes_logging] rollover of {self.baseFilename!r} "
+                    f"stuck after retries: {type(last_err).__name__}: "
+                    f"{last_err}\n"
+                )
+                try:
+                    self.stream = self._open()
+                except Exception:
+                    pass
         self._chmod_if_managed()
         # Our own rollover writes a new baseFilename; refresh the snapshot
         # so the next emit doesn't mistake it for external rotation.
