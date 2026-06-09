@@ -2,11 +2,15 @@ import { useEffect, useRef } from 'react'
 import { useNavigate } from 'react-router-dom'
 
 import { setRightSidebarTab } from '@/app/right-sidebar/store'
+import { PANE_TOGGLE_REVEAL_EVENT } from '@/components/pane-shell'
+import { matchesQuery } from '@/hooks/use-media-query'
 import { PROFILE_SLOT_COUNT } from '@/lib/keybinds/actions'
 import { comboAllowedInInput, comboFromEvent, isEditableTarget } from '@/lib/keybinds/combo'
 import { toggleCommandPalette } from '@/store/command-palette'
 import { $capture, $comboIndex, endCapture, setBinding, toggleKeybindPanel } from '@/store/keybinds'
 import {
+  CHAT_SIDEBAR_PANE_ID,
+  FILE_BROWSER_PANE_ID,
   requestSessionSearchFocus,
   setFileBrowserOpen,
   toggleFileBrowserOpen,
@@ -14,6 +18,7 @@ import {
   toggleSidebarOpen
 } from '@/store/layout'
 import {
+  $newChatProfile,
   cycleProfile,
   requestProfileCreate,
   switchProfileToSlot,
@@ -24,6 +29,7 @@ import { $activeSessionId, $sessions, setModelPickerOpen } from '@/store/session
 import { useTheme } from '@/themes/context'
 
 import { requestComposerFocus } from '../chat/composer/focus'
+import { SIDEBAR_COLLAPSE_MEDIA_QUERY } from '../layout-constants'
 import {
   AGENTS_ROUTE,
   ARTIFACTS_ROUTE,
@@ -101,6 +107,10 @@ export function useKeybinds(deps: KeybindRuntimeDeps): void {
     'nav.agents': () => navigate(AGENTS_ROUTE),
 
     'session.new': () => {
+      // Match the sidebar New Session button. A plain keyboard new chat should
+      // target the current live profile, not a stale per-profile quick-create
+      // selection from a prior action.
+      $newChatProfile.set(null)
       deps.startFreshSession()
       window.dispatchEvent(new CustomEvent('hermes:new-session-shortcut'))
     },
@@ -109,8 +119,20 @@ export function useKeybinds(deps: KeybindRuntimeDeps): void {
     'session.focusSearch': requestSessionSearchFocus,
     'session.togglePin': deps.toggleSelectedPin,
 
-    'view.toggleSidebar': toggleSidebarOpen,
-    'view.toggleRightSidebar': toggleFileBrowserOpen,
+    'view.toggleSidebar': () => {
+      if (matchesQuery(SIDEBAR_COLLAPSE_MEDIA_QUERY)) {
+        window.dispatchEvent(new CustomEvent(PANE_TOGGLE_REVEAL_EVENT, { detail: { id: CHAT_SIDEBAR_PANE_ID } }))
+      } else {
+        toggleSidebarOpen()
+      }
+    },
+    'view.toggleRightSidebar': () => {
+      if (matchesQuery(SIDEBAR_COLLAPSE_MEDIA_QUERY)) {
+        window.dispatchEvent(new CustomEvent(PANE_TOGGLE_REVEAL_EVENT, { detail: { id: FILE_BROWSER_PANE_ID } }))
+      } else {
+        toggleFileBrowserOpen()
+      }
+    },
     'view.showFiles': () => showRightSidebarTab('files'),
     'view.showTerminal': () => showRightSidebarTab('terminal'),
     'view.flipPanes': togglePanesFlipped,

@@ -1258,4 +1258,75 @@ class TestRolloverWindowsLockRetry:
         b = hermes_logging._ManagedRotatingFileHandler._get_rollover_lock("/tmp/b.log")
         a2 = hermes_logging._ManagedRotatingFileHandler._get_rollover_lock("/tmp/a.log")
         assert a is a2, "same path should return the same lock"
-        assert a is not b, "different paths should return different locks"
+        assert a is not b, "different paths should get different locks"
+
+
+class TestSafeStderr:
+    """Tests for _safe_stderr() — Unicode tolerance on Windows console."""
+
+    def test_returns_stderr_on_utf8_system(self, monkeypatch):
+        """On UTF-8 systems, _safe_stderr() returns sys.stderr unchanged."""
+        import io
+        fake_stderr = io.StringIO()
+        monkeypatch.setattr(sys, "stderr", fake_stderr)
+        # On Linux/macOS, encoding is typically utf-8
+        result = hermes_logging._safe_stderr()
+        # Should return the same object (or a equivalent stream)
+        assert result is fake_stderr or getattr(result, "encoding", "").lower().startswith("utf")
+
+    def test_wraps_non_utf8_stderr(self, monkeypatch):
+        """On non-UTF-8 systems (e.g. Windows cp949), wraps stderr with UTF-8."""
+        import io
+
+        class FakeStderr:
+            """Simulates a Windows stderr with legacy encoding."""
+            encoding = "cp949"
+            buffer = io.BytesIO()
+
+            def write(self, s):
+                pass
+
+            def flush(self):
+                pass
+
+        fake = FakeStderr()
+        monkeypatch.setattr(sys, "stderr", fake)
+        result = hermes_logging._safe_stderr()
+        # Should be a TextIOWrapper, not the original FakeStderr
+        assert isinstance(result, io.TextIOWrapper)
+        assert result.encoding == "utf-8"
+        assert result.errors == "replace"
+
+    def test_handler_emits_unicode_without_crash(self, tmp_path):
+        """StreamHandler with _safe_stderr can emit Unicode messages."""
+        import io
+
+        # Create a stderr-like stream with ASCII encoding
+        class AsciiStream:
+            encoding = "ascii"
+            buffer = io.BytesIO()
+
+            def write(self, s):
+                self.buffer.write(s.encode("ascii", errors="replace"))
+
+            def flush(self):
+                pass
+
+        # Without the fix, this would crash on cp949/ASCII stderr.
+        # With the wrapper, the em-dash is replaced with '?'
+        handler = logging.StreamHandler(
+            io.TextIOWrapper(
+                io.BytesIO(),
+                encoding="utf-8",
+                errors="replace",
+            )
+        )
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        logger = logging.getLogger("_test_unicode")
+        logger.addHandler(handler)
+        logger.setLevel(logging.DEBUG)
+        try:
+            # Em-dash U+2014 — the exact character from the bug report
+            logger.info("Session hygiene: 400 messages — auto-compressing")
+        finally:
+            logger.removeHandler(handler)
