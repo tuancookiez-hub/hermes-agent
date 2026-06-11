@@ -391,12 +391,12 @@ class _ManagedRotatingFileHandler(RotatingFileHandler):
         self._record_stream_stat()
 
     def _chmod_if_managed(self):
-        if self._managed:
+        if self._managed and not os.path.exists(self.baseFilename):
             try:
-                os.chmod(self.baseFilename, 0o660)
+                open(self.baseFilename, "a", encoding="utf-8").close()  # noqa: PLW1514
             except OSError:
                 pass
-
+            self._chmod_if_managed()
     def _record_stream_stat(self) -> None:
         """Snapshot dev/ino of ``baseFilename`` so we can detect external rotation."""
         try:

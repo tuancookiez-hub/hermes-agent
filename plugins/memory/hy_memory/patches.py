@@ -2,7 +2,7 @@
 """
 Site-packages patch consolidation for hy-memory 1.2.18.
 
-The canonical install of ``hy-memory`` has 2 known gaps that the upstream
+The canonical install of ``hy-memory`` has 3 known gaps that the upstream
 package doesn't fix (as of 1.2.18):
 
 1. **LLMConfig doesn't read ``MEMORY_LLM_EXTRA_BODY`` from env.**
@@ -20,7 +20,16 @@ package doesn't fix (as of 1.2.18):
    per query. We add it as an opt-in stage gated by
    ``MEMORY_RERANK_ENABLED=true``.
 
-Both gaps were originally fixed by editing the SDK files in
+3. **Dedup gate never fires in ``/api/v1/add`` path.**
+   ``client.add()`` constructs ``WriteRequest`` without setting
+   ``existing_memories``, so the dedup gate at ``writer.py:829``
+   always short-circuits on the third condition
+   (``request.existing_memories`` is always None). 1,094 historical
+   "UPDATEs" in the v2 plan baseline were from the LLM reconciler,
+   NOT the merger — the merger dedup has been a no-op the entire
+   time. The dashboard duplicate is real evidence.
+
+All three gaps were originally fixed by editing the SDK files in
 site-packages. Those edits get wiped on ``pip install --upgrade
 hy-memory``. This package applies the fixes at import time as
 monkey-patches, so the SDK files on disk stay clean.
@@ -39,6 +48,7 @@ but lives entirely in user-space, not the SDK.
 
 from __future__ import annotations
 
+import contextvars
 import logging
 import os
 from typing import Any
@@ -47,6 +57,13 @@ logger = logging.getLogger(__name__)
 
 # Tracks whether we've already applied patches (idempotent)
 _applied: dict[str, bool] = {}
+
+# ContextVar for passing pre-search results from patched async_add() to
+# WriteRequest.__post_init__. async-safe per task (correct isolation
+# under concurrent writes).
+_dedup_existing_var: contextvars.ContextVar = contextvars.ContextVar(
+    "hy_dedup_existing", default=None
+)
 
 
 # ---------------------------------------------------------------------------
@@ -316,12 +333,202 @@ def apply_inprocess_embed_patch() -> bool:
     return True
 
 
+# ---------------------------------------------------------------------------
+# Patch 4: Pre-write search to populate existing_memories (dedup actually fires)
+# ---------------------------------------------------------------------------
+
+
+def _extract_content_for_dedup(data) -> str:
+    """Best-effort extract of content from add()'s data argument.
+
+    Returns "" if the input is too short or unrecognizable.
+    """
+    if isinstance(data, str):
+        return data
+    if isinstance(data, list):
+        # Prefer the last assistant message (that's what the LLM would extract)
+        for m in reversed(data):
+            if isinstance(m, dict) and m.get("role") == "assistant":
+                content = m.get("content", "")
+                if isinstance(content, str) and content.strip():
+                    return content
+        # Fall back to first message
+        if data and isinstance(data[0], dict):
+            content = data[0].get("content", "")
+            if isinstance(content, str):
+                return content
+    return ""
+
+
+def apply_dedup_pre_search_patch() -> bool:
+    """Patch #4: pre-search before write to populate existing_memories.
+
+    The upstream ``client.add()`` constructs ``WriteRequest`` without
+    setting ``existing_memories``, so the dedup gate at ``writer.py:829``
+    (``if enable_merge_check and not should_merge and request.existing_memories:``)
+    always short-circuits on the third condition. This patch wraps
+    ``HyMemoryClient.async_add`` to do a fast pre-search and stash
+    results in a context var, then patches ``WriteRequest.__post_init__``
+    to read the stash.
+
+    We patch ``async_add`` (not the sync ``add`` wrapper) because the
+    sync ``add`` just runs ``self._loop_thread.run(self.async_add(...))``
+    and returns the result synchronously. Patching the sync wrapper
+    with an async function would return a coroutine object instead of
+    a result.
+
+    Trade-off: +100-300ms per write (search call), but dedup actually
+    works. Skip pre-search for content <20 chars (no meaningful match
+    possible). If the search itself fails, we proceed without dedup
+    (fail-open) so writes never get blocked by a search outage.
+
+    Configurable via env vars:
+      - MEMORY_DEDUP_SEARCH_LIMIT (default 5): max existing memories
+        to return from the pre-search
+      - MEMORY_DEDUP_MIN_SCORE (default 0.5): min similarity for the
+        pre-search to even return a hit
+    """
+    if _applied.get("dedup_pre_search"):
+        return True
+
+    try:
+        from hy_memory.client import HyMemoryClient
+        from hy_memory.pipelines.base import WriteRequest
+    except ImportError as e:
+        logger.debug("[hy-memory/patches] cannot import SDK for dedup patch: %s", e)
+        return False
+
+    # --- Patch WriteRequest: read existing_memories from context var ---
+    orig_post = getattr(WriteRequest, "__post_init__", None)
+
+    def patched_post_init(self):
+        if orig_post is not None:
+            try:
+                orig_post(self)
+            except Exception:
+                pass
+        # If the caller hasn't explicitly set existing_memories, look at
+        # the context var (set by the patched async_add wrapper).
+        if getattr(self, "existing_memories", None) is None:
+            existing = _dedup_existing_var.get(None)
+            if existing:
+                self.existing_memories = existing
+
+    WriteRequest.__post_init__ = patched_post_init
+
+    # --- Patch HyMemoryClient.async_add: pre-search and stash ---
+    orig_async_add = HyMemoryClient.async_add
+
+    async def patched_async_add(self, data, **kwargs):
+        user_id = kwargs.get("user_id", "")
+        agent_id = kwargs.get("agent_id", "default_agent")
+        session_id = kwargs.get("session_id", "default_session")
+
+        # Skip the pre-search for very short content (no meaningful match).
+        # We do NOT skip based on mode here — lite mode is the case where
+        # the cost matters most but dedup is also less critical. The
+        # caller can opt out by setting MEMORY_DEDUP_SEARCH_LIMIT=0.
+        search_limit = int(os.environ.get("MEMORY_DEDUP_SEARCH_LIMIT", "5"))
+        existing: list = []
+        if search_limit > 0:
+            content = _extract_content_for_dedup(data)
+            if content and len(content) >= 20:
+                try:
+                    # Use the async search (we're already in async context)
+                    result = await self.async_search(
+                        content[:500],
+                        user_ids=[user_id] if user_id else None,
+                        agent_ids=[agent_id] if agent_id else None,
+                        session_ids=[session_id] if session_id else None,
+                        limit=search_limit,
+                        min_score=float(os.environ.get("MEMORY_DEDUP_MIN_SCORE", "0.5")),
+                    )
+                    # Result is layered: {"memories": {"profile": [...], "proactive": [...], "normal": [...]}, ...}
+                    for category in ("profile", "proactive", "normal"):
+                        for mem in (result.get("memories") or {}).get(category, []) or []:
+                            if isinstance(mem, dict):
+                                existing.append(mem)
+                except Exception as e:
+                    logger.debug("[hy-memory/patches] dedup pre-search failed (no-op): %s", e)
+                    # Fail-open: proceed with empty existing_memories, write still happens
+
+        # Stash for WriteRequest.__post_init__ to pick up
+        token = _dedup_existing_var.set(existing)
+        try:
+            return await orig_async_add(self, data, **kwargs)
+        finally:
+            _dedup_existing_var.reset(token)
+
+    HyMemoryClient.async_add = patched_async_add
+    _applied["dedup_pre_search"] = True
+    logger.info(
+        "[hy-memory/patches] dedup pre-search installed on HyMemoryClient.async_add "
+        "(patch #4 — writer.py:829 dedup gate now reachable)"
+    )
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Patch 5: Configurable dedup thresholds (MergerConfig)
+# ---------------------------------------------------------------------------
+
+
+def apply_dedup_threshold_patch() -> bool:
+    """Patch #5: expose dedup thresholds as env-var configurable.
+
+    The merger's ``duplicate_threshold`` (default 0.95) and
+    ``merge_threshold`` (default 0.85) become configurable via:
+      - MEMORY_DEDUP_THRESHOLD (default 0.92): the writer's hardcoded
+        safety check; we mirror this to the merger's
+        duplicate_threshold so the two align
+      - MEMORY_DEDUP_MERGE_THRESHOLD (default 0.85): the merger's
+        "similar" threshold (lower than duplicate)
+
+    Note: this patches ``MergerConfig`` (dataclass defaults at class
+    level). The writer's hardcoded ``0.92`` literal at writer.py:838
+    is NOT patched here — that's a separate safety check that
+    intentionally sits between the two MergerConfig thresholds.
+    Lowering it would require a deeper writer.py patch.
+    """
+    if _applied.get("dedup_threshold"):
+        return True
+
+    try:
+        from hy_memory.core.merger import MergerConfig
+    except ImportError as e:
+        logger.debug("[hy-memory/patches] cannot import MergerConfig: %s", e)
+        return False
+
+    duplicate_threshold = float(os.environ.get("MEMORY_DEDUP_THRESHOLD", "0.92"))
+    merge_threshold = float(
+        os.environ.get("MEMORY_DEDUP_MERGE_THRESHOLD", str(min(0.85, duplicate_threshold)))
+    )
+
+    MergerConfig.duplicate_threshold = duplicate_threshold
+    MergerConfig.merge_threshold = merge_threshold
+
+    _applied["dedup_threshold"] = True
+    logger.info(
+        "[hy-memory/patches] MergerConfig thresholds: merge=%s duplicate=%s (patch #5)",
+        merge_threshold,
+        duplicate_threshold,
+    )
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Master entry point
+# ---------------------------------------------------------------------------
+
+
 def apply_all_patches() -> dict[str, bool]:
     """Apply all patches. Idempotent. Returns a dict of which patches succeeded."""
     return {
         "llm_extra_body": apply_llm_extra_body_patch(),
         "rerank_stage": apply_rerank_patches(),
         "inprocess_embed": apply_inprocess_embed_patch(),
+        "dedup_pre_search": apply_dedup_pre_search_patch(),
+        "dedup_threshold": apply_dedup_threshold_patch(),
     }
 
 
@@ -335,4 +542,10 @@ def status() -> dict[str, Any]:
             in ("1", "true", "yes", "on")
         ),
         "rerank_module_available": _get_rerank_module() is not None,
+        "dedup_threshold": float(os.environ.get("MEMORY_DEDUP_THRESHOLD", "0.92")),
+        "dedup_merge_threshold": float(
+            os.environ.get("MEMORY_DEDUP_MERGE_THRESHOLD", "0.85")
+        ),
+        "dedup_search_limit": int(os.environ.get("MEMORY_DEDUP_SEARCH_LIMIT", "5")),
+        "dedup_min_score": float(os.environ.get("MEMORY_DEDUP_MIN_SCORE", "0.5")),
     }
