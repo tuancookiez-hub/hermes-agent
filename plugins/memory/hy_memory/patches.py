@@ -517,6 +517,193 @@ def apply_dedup_threshold_patch() -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Patch 6: L1_RAW rolling-delete sweep
+# ---------------------------------------------------------------------------
+
+
+def apply_l1_raw_rolling_delete_patch() -> bool:
+    """Patch #6: periodic sweep that deletes shadowed L1_RAW entries older than
+    ``MEMORY_RAW_WINDOW_DAYS``. Prevents unbounded L1_RAW shadow accumulation
+    in the VDB. Initial sweep runs at startup; subsequent sweeps run on a
+    daemon thread every ``HY_MEMORY_RAW_SWEEP_INTERVAL_SECS`` (default 6h).
+
+    Configurable via env vars:
+      - HY_MEMORY_L1_RAW_ROLLING_DELETE (default true): master switch
+      - MEMORY_RAW_WINDOW_DAYS (default 30): retention window
+      - HY_MEMORY_RAW_SWEEP_INTERVAL_SECS (default 21600 = 6h): sweep frequency
+    """
+    if _applied.get("l1_raw_rolling_delete"):
+        return True
+
+    if os.environ.get("HY_MEMORY_L1_RAW_ROLLING_DELETE", "true").lower() not in ("1", "true", "yes", "on"):
+        return False
+
+    try:
+        from qdrant_client import QdrantClient
+        from qdrant_client.http import models
+    except ImportError as e:
+        logger.debug("[hy-memory/patches] qdrant_client not available: %s", e)
+        return False
+
+    host = os.environ.get("MEMORY_VECTOR_HOST", "127.0.0.1")
+    port = int(os.environ.get("MEMORY_VECTOR_PORT", "6333"))
+    collection = os.environ.get("MEMORY_VECTOR_COLLECTION", "agent_memories_384")
+    window_days = int(os.environ.get("MEMORY_RAW_WINDOW_DAYS", "30"))
+    sweep_interval = int(os.environ.get("HY_MEMORY_RAW_SWEEP_INTERVAL_SECS", "21600"))
+
+    def _sweep():
+        try:
+            from datetime import datetime, timedelta, timezone
+            # gmt_created in Qdrant is stored as a float (epoch seconds),
+            # so Range.lt needs a numeric cutoff, not an ISO string.
+            cutoff = (datetime.now(timezone.utc) - timedelta(days=window_days)).timestamp()
+            client = QdrantClient(host=host, port=port)
+            # qdrant-client 1.18 requires a proper selector model, not a raw dict
+            client.delete(
+                collection_name=collection,
+                points_selector=models.FilterSelector(
+                    filter=models.Filter(must=[
+                        models.FieldCondition(
+                            key="status",
+                            match=models.MatchValue(value="shadow"),
+                        ),
+                        models.FieldCondition(
+                            key="layer",
+                            match=models.MatchValue(value="l1_raw"),
+                        ),
+                        models.FieldCondition(
+                            key="gmt_created",
+                            range=models.Range(lt=cutoff),
+                        ),
+                    ])
+                ),
+            )
+            logger.info(
+                "[hy-memory/patches] L1_RAW rolling sweep: deleted entries older than %s days from %s",
+                window_days, collection,
+            )
+        except Exception as e:
+            logger.warning("[hy-memory/patches] L1_RAW rolling sweep failed: %s", e)
+
+    def _loop():
+        import time
+        while True:
+            time.sleep(sweep_interval)
+            _sweep()
+
+    import threading
+    t = threading.Thread(target=_loop, daemon=True, name="l1_raw_rolling_delete")
+    t.start()
+
+    # Initial sweep (best-effort; failure here just means next sweep is the first one)
+    _sweep()
+
+    _applied["l1_raw_rolling_delete"] = True
+    logger.info(
+        "[hy-memory/patches] L1_RAW rolling-delete installed: window=%s days, interval=%s secs (patch #6)",
+        window_days, sweep_interval,
+    )
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Patch 7: L1_RAW dedup skip (write-side dedup at the source)
+# ---------------------------------------------------------------------------
+
+
+def apply_l1_raw_dedup_skip_patch() -> bool:
+    """Patch #7: if a pre-search finds a near-duplicate (cosine score >= threshold),
+    skip the write entirely so no L1_RAW entry is created. Prevents L1_RAW shadow
+    bloat at the source rather than cleaning it up after.
+
+    Wraps ``HyMemoryClient.async_add`` to add the skip check. When a skip fires,
+    returns a response shaped like a successful add with ``skipped=True`` so
+    callers can detect it. When no skip, falls through to the wrapped version.
+
+    Cost: one extra pre-search per write (this patch's pre-search + Patch #4's
+    pre-search). Acceptable for the no-L1_RAW guarantee.
+
+    Configurable via env vars:
+      - HY_MEMORY_L1_RAW_DEDUP_SKIP (default true): master switch
+      - MEMORY_DEDUP_SKIP_THRESHOLD (default 0.92): cosine similarity for skip
+    """
+    if _applied.get("l1_raw_dedup_skip"):
+        return True
+
+    if os.environ.get("HY_MEMORY_L1_RAW_DEDUP_SKIP", "true").lower() not in ("1", "true", "yes", "on"):
+        return False
+
+    try:
+        from hy_memory.client import HyMemoryClient
+    except ImportError as e:
+        logger.debug("[hy-memory/patches] cannot import SDK for skip patch: %s", e)
+        return False
+
+    skip_threshold = float(os.environ.get("MEMORY_DEDUP_SKIP_THRESHOLD", "0.85"))
+    current_async_add = HyMemoryClient.async_add  # Patch #4's wrapped version, or upstream
+
+    async def patched_async_add_skip(self, data, **kwargs):
+        user_id = kwargs.get("user_id", "")
+        agent_id = kwargs.get("agent_id", "default_agent")
+        session_id = kwargs.get("session_id", "default_session")
+        content = _extract_content_for_dedup(data)
+
+        if content and len(content) >= 20:
+            try:
+                result = await self.async_search(
+                    content[:500],
+                    user_ids=[user_id] if user_id else None,
+                    agent_ids=[agent_id] if agent_id else None,
+                    session_ids=[session_id] if session_id else None,
+                    limit=3,
+                    min_score=max(0.5, skip_threshold - 0.1),
+                )
+                top_score = 0.0
+                top_layer = None
+                for category in ("profile", "proactive", "normal"):
+                    items = (result.get("memories") or {}).get(category, []) or []
+                    if items:
+                        top = items[0]
+                        top_score = top.get("score", 0) or 0
+                        top_layer = top.get("layer")
+                        if top_score >= skip_threshold:
+                            logger.info(
+                                "[hy-memory/patches] L1_RAW dedup skip: score=%.3f >= threshold=%.2f, existing_id=%s layer=%s",
+                                top_score, skip_threshold, top.get("memory_id", "")[:12], top_layer,
+                            )
+                            return {
+                                "success": True,
+                                "memory_id": top.get("memory_id", ""),
+                                "request_id": "",
+                                "elapsed_ms": 0,
+                                "error_code": None,
+                                "error_message": None,
+                                "skipped": True,
+                                "skip_reason": f"duplicate_score_{top_score:.3f}",
+                                "timing": {},
+                            }
+                # Log when we found a near-miss but didn't skip — for tuning
+                if top_score > 0:
+                    logger.debug(
+                        "[hy-memory/patches] L1_RAW dedup pre-search: top_score=%.3f < threshold=%.2f (layer=%s), write will proceed",
+                        top_score, skip_threshold, top_layer,
+                    )
+            except Exception as e:
+                logger.debug("[hy-memory/patches] skip pre-search failed (no-op): %s", e)
+
+        # No skip — call the wrapped version (which does its own pre-search + write)
+        return await current_async_add(self, data, **kwargs)
+
+    HyMemoryClient.async_add = patched_async_add_skip
+    _applied["l1_raw_dedup_skip"] = True
+    logger.info(
+        "[hy-memory/patches] L1_RAW dedup skip installed: threshold=%.2f (patch #7)",
+        skip_threshold,
+    )
+    return True
+
+
+# ---------------------------------------------------------------------------
 # Master entry point
 # ---------------------------------------------------------------------------
 
@@ -527,8 +714,10 @@ def apply_all_patches() -> dict[str, bool]:
         "llm_extra_body": apply_llm_extra_body_patch(),
         "rerank_stage": apply_rerank_patches(),
         "inprocess_embed": apply_inprocess_embed_patch(),
+        "l1_raw_rolling_delete": apply_l1_raw_rolling_delete_patch(),
         "dedup_pre_search": apply_dedup_pre_search_patch(),
         "dedup_threshold": apply_dedup_threshold_patch(),
+        "l1_raw_dedup_skip": apply_l1_raw_dedup_skip_patch(),
     }
 
 
@@ -548,4 +737,16 @@ def status() -> dict[str, Any]:
         ),
         "dedup_search_limit": int(os.environ.get("MEMORY_DEDUP_SEARCH_LIMIT", "5")),
         "dedup_min_score": float(os.environ.get("MEMORY_DEDUP_MIN_SCORE", "0.5")),
+        "l1_raw_rolling_delete_enabled": (
+            os.environ.get("HY_MEMORY_L1_RAW_ROLLING_DELETE", "true").strip().lower()
+            in ("1", "true", "yes", "on")
+        ),
+        "l1_raw_window_days": int(os.environ.get("MEMORY_RAW_WINDOW_DAYS", "30")),
+        "l1_raw_dedup_skip_enabled": (
+            os.environ.get("HY_MEMORY_L1_RAW_DEDUP_SKIP", "true").strip().lower()
+            in ("1", "true", "yes", "on")
+        ),
+        "l1_raw_dedup_skip_threshold": float(
+            os.environ.get("MEMORY_DEDUP_SKIP_THRESHOLD", "0.92")
+        ),
     }
