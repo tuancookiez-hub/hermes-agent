@@ -704,6 +704,132 @@ def apply_l1_raw_dedup_skip_patch() -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Patch 8: L1_RAW → SHADOW on agent completion
+# ---------------------------------------------------------------------------
+
+def apply_l1_raw_shadow_patch() -> bool:
+    """Patch #8: after the agent run completes, mark the source L1_RAW as
+    ``shadowed`` using ``update_payload`` (the correct method).
+
+    **Root cause** (writer.py:1266-1273 in hy-memory 1.2.18):
+
+        if stored_ids and memory_id:
+            try:
+                mem_node.status = MemoryStatus.SHADOW
+                await vector_store.upsert(mem_node)
+                logger.debug(f"[agent] L1 raw {memory_id} status → SHADOW")
+            except Exception as shadow_err:
+                logger.warning(f"[agent] failed to shadow L1 raw: {shadow_err}")
+
+    The L1_RAW shadow block uses ``vector_store.upsert(mem_node)``, which
+    REPLACES the entire Qdrant point (vector + payload). This silently
+    fails or breaks the point when:
+
+      - The in-memory ``mem_node.embedding`` was reset between the
+        initial write (line 740) and the shadow (line 1270) — the upsert
+        then re-inserts a point with no vector.
+      - The in-memory ``mem_node`` is a different object than the
+        persisted point (e.g., the writer was reloaded mid-write).
+
+    The SUPERSEDE/UPDATE branches in the same file (line 311, 337)
+    correctly use ``update_payload(memory_id, {...})`` for partial
+    payload updates. The L1_RAW block is the only place using the
+    wrong method.
+
+    **Verified (2026-06-13)**: the user's install had 1,015 active L1_RAWs
+    after Phase 5 cleanup. After applying this patch, every new
+    write's L1_RAW is shadowed at agent-completion time. The rolling-delete
+    patch (#6) and dedup-skip patch (#7) become unnecessary for new
+    writes (they still apply to old shadowed L1_RAWs that pre-date this
+    fix).
+
+    **Upstream PR**: this is a 4-line change to ``writer.py:1269-1270``
+    in the upstream ``hy-memory`` package. See the design doc at
+    ``F:\\MemorySystem\\.hermes\\plans\\patch-foundation-l5-bench-2026-06-13.md``
+    for the PR template.
+
+    **Verified working (2026-06-13, 4 test writes)**: every fresh
+    L1_RAW created by a new ``/api/v1/add`` call gets
+    ``is_latest=False, status=shadow`` set via ``update_payload``
+    after the agent completes. Before/after active-L1_RAW counts stay
+    constant for new writes (no growth). The user's 1,015-L1_RAW
+    backlog (from Phase 5) is now bounded by the rolling-delete patch
+    (#6); new writes no longer add to it.
+    """
+    if _applied.get("l1_raw_shadow"):
+        return True
+
+    try:
+        from hy_memory.pipelines.writer import MemoryWriter
+        from hy_memory.models.memory import MemoryStatus
+    except ImportError as e:
+        logger.debug("[hy-memory/patches] cannot import MemoryWriter / MemoryStatus: %s", e)
+        return False
+
+    if MemoryWriter._run_agent.__name__ == "_run_agent_with_l1_shadow":
+        _applied["l1_raw_shadow"] = True
+        return True
+
+    original_run_agent = MemoryWriter._run_agent
+    shadow_status_value = MemoryStatus.SHADOW.value
+
+    async def _run_agent_with_l1_shadow(*args, **kwargs):
+        # Run the original agent. Args from writer.py:794 are all keyword:
+        #   request, response, vector_store, mem_node, memory_id,
+        #   tracer_span, history_context
+        result = await original_run_agent(*args, **kwargs)
+
+        # After the agent finishes, ensure the source L1_RAW is shadowed
+        # via the correct method (update_payload), regardless of whether
+        # the broken upsert-based path succeeded.
+        try:
+            response = kwargs.get("response")
+            vector_store = kwargs.get("vector_store")
+            memory_id = kwargs.get("memory_id")
+            if response is None or vector_store is None or not memory_id:
+                return result
+
+            # Only shadow if the agent actually produced facts (matches the
+            # upstream condition at writer.py:1267 — `if stored_ids and memory_id`).
+            stored_ids = (
+                getattr(response, "extra", {}).get("agent_stored_ids", [])
+                if hasattr(response, "extra")
+                else []
+            )
+            if not stored_ids:
+                return result
+
+            update_payload = getattr(vector_store, "update_payload", None)
+            if update_payload is None:
+                return result
+
+            await update_payload(
+                memory_id,
+                {
+                    "is_latest": False,
+                    "status": shadow_status_value,
+                },
+            )
+            logger.info(
+                "[hy-memory/patches] L1_RAW %s → SHADOW via update_payload (patch #8)",
+                memory_id,
+            )
+        except Exception as e:
+            logger.warning(
+                "[hy-memory/patches] L1_RAW shadow patch failed for %s: %s",
+                kwargs.get("memory_id", "?"),
+                e,
+            )
+
+        return result
+
+    MemoryWriter._run_agent = _run_agent_with_l1_shadow
+    _applied["l1_raw_shadow"] = True
+    logger.info("[hy-memory/patches] L1_RAW shadow patch installed (patch #8)")
+    return True
+
+
+# ---------------------------------------------------------------------------
 # Master entry point
 # ---------------------------------------------------------------------------
 
@@ -718,6 +844,7 @@ def apply_all_patches() -> dict[str, bool]:
         "dedup_pre_search": apply_dedup_pre_search_patch(),
         "dedup_threshold": apply_dedup_threshold_patch(),
         "l1_raw_dedup_skip": apply_l1_raw_dedup_skip_patch(),
+        "l1_raw_shadow": apply_l1_raw_shadow_patch(),
     }
 
 
