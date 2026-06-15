@@ -32,7 +32,7 @@ import logging
 import os
 import sys
 import threading
-from logging.handlers import RotatingFileHandler
+from concurrent_log_handler import ConcurrentRotatingFileHandler as RotatingFileHandler
 from pathlib import Path
 from typing import Optional, Sequence
 
@@ -467,6 +467,12 @@ class _ManagedRotatingFileHandler(RotatingFileHandler):
         return stream
 
     def doRollover(self):
+        # ConcurrentRotatingFileHandler.doRollover() acquires a cross-process
+        # file lock before renaming, so two Hermes processes can both rotate
+        # without colliding on Windows.  The base raises if the lock cannot
+        # be acquired within its configured timeout — that surfaces in
+        # logging.Handler.handleError() as a single stderr line per failed
+        # rollover attempt, NOT a 40-line traceback per log emit.
         super().doRollover()
         self._chmod_if_managed()
         # Our own rollover writes a new baseFilename; refresh the snapshot
