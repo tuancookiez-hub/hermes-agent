@@ -17,13 +17,14 @@ Server: localhost:19527 by default, auto-started by the plugin.
 
 from __future__ import annotations
 
+import datetime as _dt
 import json
 import logging
 import os
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Tuple
 
 from agent.memory_provider import MemoryProvider
 from hermes_constants import get_hermes_home
@@ -36,6 +37,20 @@ _BREAKER_THRESHOLD = 5
 _BREAKER_COOLDOWN_SECS = 120
 
 _DEFAULT_PORT = 19527
+
+# Max chars injected into system prompt (per official hermes-hy-memory)
+_MAX_PREFETCH_CHARS = int(os.environ.get("HY_MEMORY_PREFETCH_MAX_CHARS", "2000"))
+
+# Write throttling: every N turns flushes the session buffer (per official).
+# Default 5 (matches OpenClaw's memoryWriteTurnWindow). Set to 1 to write
+# every turn (old single-turn behavior).
+_WRITE_TURN_WINDOW = max(1, int(os.environ.get("HY_MEMORY_WRITE_TURN_WINDOW", "5") or "5"))
+
+# Short confirmations / greetings to skip prefetch on (per official)
+_SKIP_QUERIES = frozenset({
+    "ok", "好", "好的", "thanks", "谢谢", "y", "n", "yes", "no",
+    "继续", "go", "嗯", "嗯嗯", "对", "对的",
+})
 
 
 # ---------------------------------------------------------------------------
@@ -71,20 +86,6 @@ def _load_config() -> dict:
     return config
 
 
-def _format_memories(memories: list[dict]) -> str:
-    """Format search results into a readable context string."""
-    if not memories:
-        return ""
-    lines = []
-    for m in memories:
-        content = m.get("content", "")
-        layer = m.get("layer", "")
-        score = m.get("score", 0)
-        prefix = f"[{layer}] " if layer else ""
-        lines.append(f"{prefix}{content} (score: {score:.2f})")
-    return "\n".join(lines)
-
-
 # ---------------------------------------------------------------------------
 # Provider
 # ---------------------------------------------------------------------------
@@ -105,6 +106,12 @@ class HyMemoryProvider(MemoryProvider):
         self._prefetch_thread: threading.Thread | None = None
         # Sync
         self._sync_thread: threading.Thread | None = None
+        # Write throttling (per official hermes-hy-memory 0.2.7)
+        # Buffers N turns before flushing — saves LLM extraction calls
+        # and prevents per-turn retry storms when the same content repeats.
+        self._write_turn_window: int = _WRITE_TURN_WINDOW
+        self._turn_buffer: Dict[str, List[Dict[str, str]]] = {}
+        self._buffer_lock = threading.Lock()
         # Circuit breaker
         self._consecutive_failures = 0
         self._breaker_open_until = 0.0
@@ -182,12 +189,41 @@ class HyMemoryProvider(MemoryProvider):
     # ------------------------------------------------------------------
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
-        """Return cached prefetch result from background thread."""
-        with self._prefetch_lock:
-            return self._prefetch_result
+        """Synchronous recall — return formatted memories for the query.
+
+        Per official hermes-hy-memory 0.2.7: search the SDK with the user's
+        query, flatten the result, format it with `<relevant-memories>` tags
+        and evolution-chain expansion (oldest→newest), truncated to
+        _MAX_PREFETCH_CHARS. Short queries and greetings are skipped to
+        avoid noisy prefetch.
+        """
+        if not self._client or not query:
+            return ""
+
+        q = query.strip()
+        if len(q) < 3 or q.lower() in _SKIP_QUERIES:
+            return ""
+
+        try:
+            result = self._client.search(
+                q, user_ids=[self._user_id],
+                agent_ids=[self._agent_id], limit=10,
+            )
+            memories = self._flatten_memories(result.get("memories"))
+            if not memories:
+                return ""
+            return self._format_memories_for_prompt(memories)
+        except Exception as e:
+            self._consecutive_failures += 1
+            if self._consecutive_failures >= _BREAKER_THRESHOLD:
+                self._breaker_open_until = time.time() + _BREAKER_COOLDOWN_SECS
+                logger.warning("[hy-memory] Circuit breaker open: %s", e)
+            else:
+                logger.debug("[hy-memory] prefetch failed: %s", e)
+            return ""
 
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
-        """Start background search for the next turn."""
+        """Start background search for the next turn (legacy async path)."""
         if not self._client:
             return
 
@@ -203,8 +239,8 @@ class HyMemoryProvider(MemoryProvider):
                     query, user_ids=[self._user_id],
                     agent_ids=[self._agent_id], limit=5,
                 )
-                memories = result.get("memories", [])
-                formatted = _format_memories(memories)
+                memories = self._flatten_memories(result.get("memories"))
+                formatted = self._format_memories_for_prompt(memories) if memories else ""
                 with self._prefetch_lock:
                     self._prefetch_result = formatted
                 self._consecutive_failures = 0
@@ -225,8 +261,19 @@ class HyMemoryProvider(MemoryProvider):
 
     def sync_turn(self, user_content: str, assistant_content: str, *,
                   session_id: str = "", messages: list | None = None) -> None:
-        """Queue memory write in background."""
-        if not self._client:
+        """Buffer turn; flush to memory every N turns (per official 0.2.7).
+
+        Per official hermes-hy-memory 0.2.7 write throttling: pairs of
+        (user, assistant) messages accumulate in _turn_buffer[session_id]
+        and only flush when the buffer hits _write_turn_window turns. This
+        batches the LLM extraction call across N turns (saves tokens, faster
+        than per-turn extraction) and prevents identical per-turn duplicates
+        when the user repeats themselves.
+
+        Tail-end turns below the window are flushed on on_session_end,
+        on_pre_compress, and shutdown — never lost.
+        """
+        if not self._client or not user_content:
             return
 
         # Circuit breaker
@@ -235,15 +282,32 @@ class HyMemoryProvider(MemoryProvider):
                 return
             self._consecutive_failures = 0
 
+        # Resolve session id (allow per-call override; default = current)
+        sid = session_id or "default_session"
+
+        with self._buffer_lock:
+            buf = self._turn_buffer.setdefault(sid, [])
+            if messages:
+                buf.extend(messages)
+            else:
+                buf.append({"role": "user", "content": user_content})
+                buf.append({"role": "assistant", "content": assistant_content or ""})
+            turns = sum(1 for m in buf if m["role"] == "user")
+            if turns < self._write_turn_window:
+                logger.debug(
+                    "[hy-memory] sync_turn buffered: %d/%d turns (session=%s) — waiting",
+                    turns, self._write_turn_window, sid,
+                )
+                return
+            # Window hit: take the batch, clear the buffer, flush async
+            batch = buf[:]
+            self._turn_buffer[sid] = []
+
         def _do_sync():
             try:
-                data = messages or [
-                    {"role": "user", "content": user_content},
-                    {"role": "assistant", "content": assistant_content},
-                ]
                 self._client.add(
-                    data, user_id=self._user_id,
-                    agent_id=self._agent_id, session_id=session_id,
+                    batch, user_id=self._user_id,
+                    agent_id=self._agent_id, session_id=sid,
                 )
                 self._consecutive_failures = 0
             except Exception as e:
@@ -258,20 +322,154 @@ class HyMemoryProvider(MemoryProvider):
         self._sync_thread.start()
 
     # ------------------------------------------------------------------
+    # Memory formatting (port of official hermes-hy-memory 0.2.7)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _flatten_memories(memories: Any) -> List[Dict[str, Any]]:
+        """Flatten SDK search() return to a single ordered list.
+
+        SDK returns either:
+          - dict keyed by channel: {"profile": [...], "proactive": [...], "normal": [...]}
+          - legacy flat list
+
+        The three channels are layer-mutually-exclusive (profile=l0/l6,
+        proactive=l7, normal=other), so no dedup is needed. Order
+        profile → proactive → normal gives user-identity memories priority
+        in the prompt budget.
+        """
+        if isinstance(memories, dict):
+            out: List[Dict[str, Any]] = []
+            for ch in ("profile", "proactive", "normal"):
+                out.extend(memories.get(ch) or [])
+            return out
+        return memories or []
+
+    @staticmethod
+    def _fmt_time(ts: Any) -> str:
+        """Format unix-seconds timestamp to 'YYYY-MM-DD HH:MM' (or '' if invalid).
+
+        Matches OpenClaw's formatTime so the injected block is readable
+        and consistent across plugins.
+        """
+        if ts is None:
+            return ""
+        try:
+            return _dt.datetime.fromtimestamp(int(ts)).strftime("%Y-%m-%d %H:%M")
+        except Exception:
+            return ""
+
+    def _format_memories_for_prompt(self, memories: List[Dict[str, Any]]) -> str:
+        """Format memories as a system-prompt injection block.
+
+        Rules (aligned with official hermes-hy-memory 0.2.7 / OpenClaw):
+          - Outer block wrapped in <relevant-memories>...</relevant-memories>
+            with a short header explaining the format.
+          - Normal memories: `- [N] <time>  <content>`
+          - Evolution chains (len > 1, latest→oldest in payload) are expanded
+            oldest→newest, prefixed with `[Evolved, K versions]`.
+          - Total length truncated to _MAX_PREFETCH_CHARS (default 2000).
+          - Single-entry cap: 800 chars to avoid one long memory eating
+            the whole budget.
+        """
+        items: List[str] = []
+        running = 0
+        idx = 0
+        for mem in memories:
+            chain = mem.get("evolution_chain")
+            if chain and isinstance(chain, list) and len(chain) > 1:
+                # chain[0] = newest, chain[-1] = oldest; expand oldest→newest
+                lines: List[str] = []
+                for i in range(len(chain) - 1, 0, -1):
+                    c = chain[i] or {}
+                    when = self._fmt_time(c.get("memory_at"))
+                    content = (c.get("content") or "").strip()
+                    lines.append(f"  [v{len(chain) - i}] {when + '  ' if when else ''}{content}")
+                head = chain[0] or {}
+                head_when = self._fmt_time(head.get("memory_at"))
+                head_content = (head.get("content") or mem.get("content") or "").strip()
+                lines.append(f"  [Latest] {head_when + '  ' if head_when else ''}{head_content}")
+                entry = f"- [{idx + 1}] [Evolved, {len(chain)} versions]\n" + "\n".join(lines)
+            else:
+                content = (mem.get("content") or "").strip()
+                if not content:
+                    continue
+                when = self._fmt_time(mem.get("memory_at"))
+                entry = f"- [{idx + 1}] {when + '  ' if when else ''}{content}"
+
+            # Cap single-entry length
+            if len(entry) > 800:
+                entry = entry[:800].rstrip() + "..."
+            if running + len(entry) > _MAX_PREFETCH_CHARS:
+                break
+            items.append(entry)
+            running += len(entry) + 1
+            idx += 1
+
+        if not items:
+            return ""
+        body = "\n".join(items)
+        return (
+            "<relevant-memories>\n"
+            "The following are stored memories for the current user. Use them to "
+            "personalize your response. Memories with evolution chains are expanded "
+            "from oldest to newest:\n"
+            f"{body}\n"
+            "</relevant-memories>"
+        )
+
+    def _flush_session_buffer(self, session_id: Optional[str] = None) -> None:
+        """Flush any pending turns below the write window.
+
+        Called by on_session_end, on_pre_compress, and shutdown. With
+        session_id=None, flushes all sessions (shutdown use case).
+        """
+        with self._buffer_lock:
+            if session_id is None:
+                pending: List[Tuple[str, List[Dict[str, str]]]] = [
+                    (sid, msgs[:]) for sid, msgs in self._turn_buffer.items() if msgs
+                ]
+                self._turn_buffer.clear()
+            else:
+                msgs = self._turn_buffer.get(session_id) or []
+                pending = [(session_id, msgs[:])] if msgs else []
+                if session_id in self._turn_buffer:
+                    self._turn_buffer[session_id] = []
+
+        for sid, msgs in pending:
+            if not msgs:
+                continue
+            try:
+                self._client.add(
+                    msgs, user_id=self._user_id,
+                    agent_id=self._agent_id, session_id=sid,
+                )
+                logger.info("[hy-memory] tail flush: %d msgs (session=%s)", len(msgs), sid)
+            except Exception as e:
+                logger.debug("[hy-memory] tail flush failed: %s", e)
+
+    # ------------------------------------------------------------------
     # Session hooks
     # ------------------------------------------------------------------
 
     def on_session_end(self, messages: list[dict[str, Any]]) -> None:
-        """Write final session snapshot on session end."""
-        if not self._client or not messages:
+        """Write final session snapshot on session end.
+
+        Per official 0.2.7: also flush any buffered turns that didn't
+        hit the write window, so we never lose tail-end context.
+        """
+        if not self._client:
             return
-        try:
-            self._client.add(
-                messages, user_id=self._user_id,
-                agent_id=self._agent_id, session_id="session-end",
-            )
-        except Exception as e:
-            logger.debug("[hy-memory] on_session_end write failed: %s", e)
+        # Flush whatever's pending in the buffer (per official behavior)
+        self._flush_session_buffer(None)
+        if messages:
+            try:
+                self._client.add(
+                    messages, user_id=self._user_id,
+                    agent_id=self._agent_id, session_id="session-end",
+                )
+            except Exception as e:
+                logger.debug("[hy-memory] on_session_end write failed: %s", e)
 
     def on_pre_compress(self, messages: list[dict[str, Any]]) -> str:
         """Extract insights before context compression."""
@@ -348,7 +546,14 @@ class HyMemoryProvider(MemoryProvider):
     # ------------------------------------------------------------------
 
     def shutdown(self) -> None:
-        """Stop the server if we started it."""
+        """Stop the server if we started it. Flushes buffered turns first."""
+        # Flush any pending turns (per official 0.2.7 — never lose context
+        # even on shutdown mid-window)
+        if self._client:
+            try:
+                self._flush_session_buffer(None)
+            except Exception as e:
+                logger.debug("[hy-memory] shutdown flush failed: %s", e)
         if self._process:
             self._process.stop()
             self._process = None
