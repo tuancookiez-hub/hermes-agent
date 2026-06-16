@@ -126,6 +126,98 @@ def apply_llm_extra_body_patch() -> bool:
     return True
 
 
+def apply_l3_summary_patch() -> bool:
+    """Conditionally enable L3_SUMMARY on every Nth add.
+
+    L3 generation is a per-call LLM call, so doing it on every add doubles active
+    latency. This wrapper enables summaries only after a per-user add counter
+    reaches MEMORY_L3_TRIGGER_EVERY. Patch HyMemoryClient.add because all server
+    paths eventually call it.
+    """
+    if _applied.get("l3_summary"):
+        return True
+
+    try:
+        import json as _json
+        import os
+        from pathlib import Path
+        from hy_memory.client import HyMemoryClient
+    except Exception as e:
+        logger.debug("[hy-memory/patches] l3_summary: cannot import deps: %s", e)
+        return False
+
+    every = int(os.environ.get("MEMORY_L3_TRIGGER_EVERY", "20"))
+    if every <= 0:
+        logger.info("[hy-memory/patches] L3 conditional trigger disabled")
+        _applied["l3_summary"] = True
+        return True
+
+    home = Path(os.environ.get("HERMES_HOME", Path.home() / "AppData/Local/hermes"))
+    file = home / "l3_add_counts.json"
+    try:
+        counts = _json.loads(file.read_text(encoding="utf-8")) if file.exists() else {}
+    except Exception:
+        counts = {}
+
+    def save():
+        try:
+            file.write_text(_json.dumps(counts), encoding="utf-8")
+        except Exception:
+            pass
+
+    orig = HyMemoryClient.add
+
+    def patched(
+        self,
+        data,
+        *,
+        user_id="",
+        agent_id="default_agent",
+        session_id="default_session",
+        metadata=None,
+        memory_at=None,
+        enable_summary=None,
+        workspace_id=None,
+        branch=None,
+        request_id=None,
+    ):
+        user = user_id or "default"
+        summary = enable_summary
+        if summary is None:
+            last = int(counts.get(user, 0))
+            if last >= every:
+                summary = True
+                counts[user] = 0
+                logger.info(
+                    f"[hy-memory/patches] L3 trigger fired for user={user} "
+                    f"(every {every} adds)"
+                )
+            else:
+                counts[user] = last + 1
+            save()
+        return orig(
+            self,
+            data,
+            user_id=user_id,
+            agent_id=agent_id,
+            session_id=session_id,
+            metadata=metadata,
+            memory_at=memory_at,
+            enable_summary=summary,
+            workspace_id=workspace_id,
+            branch=branch,
+            request_id=request_id,
+        )
+
+    HyMemoryClient.add = patched
+    _applied["l3_summary"] = True
+    logger.info(
+        f"[hy-memory/patches] L3 conditional trigger enabled on HyMemoryClient.add "
+        f"(every {every} adds per user)"
+    )
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Patch 2: Cross-encoder rerank stage
 # ---------------------------------------------------------------------------
@@ -1631,6 +1723,7 @@ def apply_all_patches() -> dict[str, bool]:
     """Apply all patches. Idempotent. Returns a dict of which patches succeeded."""
     return {
         "llm_extra_body": apply_llm_extra_body_patch(),
+        "l3_summary": apply_l3_summary_patch(),
         "rerank_stage": apply_rerank_patches(),
         "inprocess_embed": apply_inprocess_embed_patch(),
         "l1_raw_rolling_delete": apply_l1_raw_rolling_delete_patch(),
