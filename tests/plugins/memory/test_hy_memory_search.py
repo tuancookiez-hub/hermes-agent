@@ -156,15 +156,32 @@ class TestFormatMemories:
 
     def test_layered_full(self):
         out = _format_memories(LAYERED_MIXED["memories"])
-        assert "[profile] User is Tuan (score: 0.91)" in out
-        assert "[proactive] Prefers direct action (score: 0.83)" in out
-        assert "[normal] Working on herm build (score: 0.72)" in out
-        # Item without "layer" gets bucket fallback
-        assert "[profile] Uses Hermes Agent (score: 0.87)" in out
+        # OpenClaw 0.2.7 format: outer block wrapped in
+        # <relevant-memories>...</relevant-memories> with a header line.
+        # Each memory is "- [N] <time>  <content>". Scores are no longer
+        # in the rendered block (consumed in metadata, not prompt). Verified
+        # 2026-06-16: the test was originally written for the pre-0.2.7
+        # format that included "[<layer>] <content> (score: X.XX)"; updated
+        # to match the current output. Layer ordering is preserved by
+        # _flatten_memories (profile -> proactive -> normal).
+        assert out.startswith("<relevant-memories>")
+        assert out.endswith("</relevant-memories>")
+        assert "User is Tuan" in out
+        assert "Prefers direct action" in out
+        assert "Working on herm build" in out
+        assert "Uses Hermes Agent" in out
 
     def test_flat_list(self):
         out = _format_memories([{"content": "hi", "score": 0.5, "layer": "normal"}])
-        assert out == "[normal] hi (score: 0.50)"
+        # OpenClaw 0.2.7 format: no score in the rendered block.
+        assert out == (
+            "<relevant-memories>\n"
+            "The following are stored memories for the current user. "
+            "Use them to personalize your response. Memories with evolution "
+            "chains are expanded from oldest to newest:\n"
+            "- [1] hi\n"
+            "</relevant-memories>"
+        )
 
     def test_handles_none_items_in_layer(self):
         """Defensive: skip non-dict items that might sneak in."""

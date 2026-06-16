@@ -376,6 +376,13 @@ class HyMemoryProvider(MemoryProvider):
         running = 0
         idx = 0
         for mem in memories:
+            # Defensive: skip None / non-dict items that might sneak in
+            # (e.g. when the server returns a partially-typed layer with
+            # a None placeholder for a deleted memory). Verified 2026-06-16
+            # in the test suite: test_handles_none_items_in_layer expects
+            # graceful skip rather than a TypeError on `.get()`.
+            if not isinstance(mem, dict):
+                continue
             chain = mem.get("evolution_chain")
             if chain and isinstance(chain, list) and len(chain) > 1:
                 # chain[0] = newest, chain[-1] = oldest; expand oldest→newest
@@ -526,15 +533,39 @@ class HyMemoryProvider(MemoryProvider):
                 query, user_ids=[self._user_id],
                 agent_ids=[self._agent_id], limit=limit,
             )
-            memories = result.get("memories", [])
+            # SDK v1.2+ returns {"memories": {"profile": [...], "proactive":
+            # [...], "normal": [...]}, "request_id": ..., "elapsed_ms": ...}.
+            # The inner "memories" key holds the layered dict; flatten it
+            # to a single ordered list. Also handles the legacy shape
+            # where the SDK returns the layered dict at the top level.
+            # Without this, `result.get("memories", [])` returns the layered
+            # dict and `m.get("content", "")` crashes. Verified 2026-06-16.
+            inner = result.get("memories") if isinstance(result, dict) else result
+            memories = self._flatten_memories(inner)
             if not memories:
                 return json.dumps({"memories": [], "note": "No relevant memories found"})
 
             formatted = []
             for m in memories:
+                # Some server-side items lack a "layer" field. Default to
+                # the bucket name (set by _flatten_memories channel order:
+                # profile → proactive → normal). Verified 2026-06-16:
+                # test_layered_mixed_flattens_preserving_layer expects
+                # layer=profile on items where the server omitted it.
+                layer = m.get("layer", "") or ""
+                # The bucket name is encoded in the flatten call order;
+                # we recover it by inspecting which channel this list
+                # element came from. Simpler: re-derive the bucket here
+                # from the original layered shape.
+                if not layer and isinstance(result, dict) and "memories" in result:
+                    layered = result["memories"]
+                    for ch in ("profile", "proactive", "normal"):
+                        if ch in layered and m in (layered[ch] or []):
+                            layer = ch
+                            break
                 formatted.append({
                     "content": m.get("content", ""),
-                    "layer": m.get("layer", ""),
+                    "layer": layer,
                     "score": round(m.get("score", 0), 3),
                 })
             return json.dumps({"memories": formatted})
@@ -823,3 +854,25 @@ def _write_env_vars(env_path: Path, env_writes: dict) -> None:
         env_path.chmod(stat.S_IRUSR | stat.S_IWUSR)
     except OSError:
         pass  # Windows
+
+
+# Module-level compatibility shim for tests + external callers that
+# imported the old `_format_memories` function. The current implementation
+# is a method on HyMemoryProvider, so we expose a thin module-level wrapper
+# that instantiates a default provider and delegates. Verified 2026-06-16:
+# restoring the old import path so the carried-over test suite (test_hy_
+# memory_search.py) keeps working without rewrites.
+def _format_memories(memories):
+    """Module-level shim for HyMemoryProvider._format_memories_for_prompt.
+    New code should call the method directly via a provider instance.
+    """
+    if memories is None:
+        return ""
+    # Flatten SDK layered-dict shape ({profile, proactive, normal}) to a
+    # single ordered list before delegating. _format_memories_for_prompt
+    # expects a flat list of dicts, not a layered dict. Verified 2026-06-16:
+    # without this, the test case `test_layered_full` crashes with
+    # "'str' object has no attribute 'get'" on `mem.get("evolution_chain")`.
+    return HyMemoryProvider()._format_memories_for_prompt(
+        HyMemoryProvider._flatten_memories(memories)
+    )

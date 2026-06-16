@@ -2,7 +2,6 @@ name: hy_memory
 version: 1.0.0
 description: "Hy-Memory — 7-layer cognitive memory with System1/System2 dual processing, evolution chains, and Kuzu graph."
 pip_dependencies:
-  - hy-memory
   - kuzu
   - chromadb
 requires_env: []
