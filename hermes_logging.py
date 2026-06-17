@@ -496,7 +496,21 @@ class _ManagedRotatingFileHandler(RotatingFileHandler):
         return stream
 
     def doRollover(self):
-        super().doRollover()
+        try:
+            super().doRollover()
+        except PermissionError as exc:
+            # CLH's portalocker makes a WinError 32 rare, but external races
+            # (AV scan, OneDrive sync, logrotate) can still trip it.  Letting
+            # the exception escape reaches emit(), where Python's logging
+            # framework catches it and prints a "Logging error" traceback on
+            # every subsequent write — which is the exact stderr spam this
+            # whole module was built to prevent.  Swallow with a warning so
+            # the operator sees the cause and the next emit retries the
+            # rotation on its own.
+            logger.warning(
+                "Log rollover failed (will retry on next emit): %s", exc
+            )
+            return
         self._chmod_if_managed()
         # Our own rollover writes a new baseFilename; refresh the snapshot
         # so the next emit doesn't mistake it for external rotation.
